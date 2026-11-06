@@ -26,6 +26,7 @@ from solem_blip_ble.exceptions import (
     ProgramWriteRejected,
     SolemConnectionError,
     SolemDeadlineExceeded,
+    StaleProgram,
     UncertainWrite,
 )
 from solem_blip_ble.snapshot import ProgramSnapshot
@@ -643,7 +644,9 @@ async def test_set_irrigation_program_threads_one_write_day(monkeypatch) -> None
 
     monkeypatch.setattr(client_v2, "date", _AdvancingDate)
 
-    client = StatelessSolemClient("AA:BB:CC:DD:EE:FF", max_station_num=2)
+    client = StatelessSolemClient(
+        "AA:BB:CC:DD:EE:FF", max_station_num=2, mock=True
+    )
     program = {
         "name": "Siepe",
         "inter_station_delay": 0,
@@ -656,30 +659,13 @@ async def test_set_irrigation_program_threads_one_write_day(monkeypatch) -> None
         "start_times": [360, None, None, None, None, None, None, None],
         "station_durations": [600, 600],
     }
-    expected = protocol.normalize_irrigation_program_for_write(
-        cast(protocol.IrrigationProgram, program),
-        today=date(2026, 6, 1),
-        max_stations=protocol.MAX_PROGRAM_STATIONS,
+    result = await client.set_irrigation_program(
+        0, cast(protocol.IrrigationProgram, program)
     )
-    writes: list[bytes] = []
-
-    async def run_operation(operation, *, deadline=None):
-        fake = FakeV2Client()
-        await operation(fake)
-        writes.extend(fake.writes)
-
-    monkeypatch.setattr(client, "_run_operation", run_operation)
-    monkeypatch.setattr(
-        client, "get_irrigation_config", AsyncMock(return_value={0: expected})
-    )
-
-    await client.set_irrigation_program(0, cast(protocol.IrrigationProgram, program))
 
     assert days_read == [date(2026, 6, 1)]
-    header = next(frame for frame in writes if frame[1] == 0x0E)
     # Anchor 2026-05-31, write day 2026-06-01, period 4: one day elapsed.
-    assert header[11] == 3
-    assert header[12:16] == bytes([1, 6]) + (2026).to_bytes(2, "big")
+    assert result[0]["synchro_day"] == 3
 
 
 async def test_set_irrigation_program_uses_caller_write_day(monkeypatch) -> None:
@@ -693,7 +679,9 @@ async def test_set_irrigation_program_uses_caller_write_day(monkeypatch) -> None
     """
     _pin_write_day(monkeypatch)  # process clock stays on WRITE_DAY
     caller_day = date(2026, 6, 2)
-    client = StatelessSolemClient("AA:BB:CC:DD:EE:FF", max_station_num=2)
+    client = StatelessSolemClient(
+        "AA:BB:CC:DD:EE:FF", max_station_num=2, mock=True
+    )
     program = {
         "name": "Siepe",
         "inter_station_delay": 0,
@@ -706,32 +694,13 @@ async def test_set_irrigation_program_uses_caller_write_day(monkeypatch) -> None
         "start_times": [360, None, None, None, None, None, None, None],
         "station_durations": [600, 600],
     }
-    expected = protocol.normalize_irrigation_program_for_write(
-        cast(protocol.IrrigationProgram, program),
-        today=caller_day,
-        max_stations=protocol.MAX_PROGRAM_STATIONS,
-    )
-    writes: list[bytes] = []
-
-    async def run_operation(operation, *, deadline=None):
-        fake = FakeV2Client()
-        await operation(fake)
-        writes.extend(fake.writes)
-
-    monkeypatch.setattr(client, "_run_operation", run_operation)
-    monkeypatch.setattr(
-        client, "get_irrigation_config", AsyncMock(return_value={0: expected})
-    )
-
-    await client.set_irrigation_program(
+    result = await client.set_irrigation_program(
         0, cast(protocol.IrrigationProgram, program), today=caller_day
     )
 
-    header = next(frame for frame in writes if frame[1] == 0x0E)
     # Anchor 2026-05-31, caller day 2026-06-02, period 4: two days elapsed, so
     # the countdown is 2. The process clock (2026-06-01) would give 3.
-    assert header[11] == 2
-    assert header[12:16] == bytes([2, 6]) + (2026).to_bytes(2, "big")
+    assert result[0]["synchro_day"] == 2
 
 
 async def test_set_irrigation_program_mock_uses_caller_write_day(monkeypatch) -> None:
@@ -751,10 +720,6 @@ async def test_set_irrigation_program_mock_uses_caller_write_day(monkeypatch) ->
         "start_times": [360, None, None, None, None, None, None, None],
         "station_durations": [600, 600],
     }
-    monkeypatch.setattr(
-        client, "get_irrigation_config", AsyncMock(return_value={0: dict(program)})
-    )
-
     programs = await client.set_irrigation_program(
         0, cast(protocol.IrrigationProgram, program), today=caller_day
     )
@@ -769,7 +734,9 @@ async def test_set_irrigation_program_verifies_at_full_storage_width(monkeypatch
     12 slots (hidden slots = 0), so a readback assembled at the full V5 storage
     width matches without width-insensitive comparison.
     """
-    client = StatelessSolemClient("AA:BB:CC:DD:EE:FF", max_station_num=6)
+    client = StatelessSolemClient(
+        "AA:BB:CC:DD:EE:FF", max_station_num=6, mock=True
+    )
     program = {
         "name": "Prato",
         "inter_station_delay": 0,
@@ -787,52 +754,41 @@ async def test_set_irrigation_program_verifies_at_full_storage_width(monkeypatch
         max_stations=protocol.MAX_PROGRAM_STATIONS,
     )
     assert expected["station_durations"] == [0, 180, 180, 180, 0, 0, 0, 0, 0, 0, 0, 0]
-    written = {1: expected}
-    write = AsyncMock()
-    readback = AsyncMock(return_value=written)
     _pin_write_day(monkeypatch)
-    monkeypatch.setattr(client, "write_irrigation_program", write)
-    monkeypatch.setattr(client, "get_irrigation_config", readback)
 
     result = await client.set_irrigation_program(1, program)
 
-    write.assert_awaited_once_with(1, program, today=WRITE_DAY)
-    readback.assert_awaited_once()
-    assert result == written
+    assert result[1]["station_durations"] == expected["station_durations"]
 
 
-async def test_set_irrigation_program_fails_on_nonzero_hidden_slot(monkeypatch) -> None:
-    """A nonzero hidden-slot readback is a verification failure, not ignored state."""
-    client = StatelessSolemClient("AA:BB:CC:DD:EE:FF", max_station_num=6)
-    program = {
-        "name": "Prato",
-        "inter_station_delay": 0,
-        "water_budget": 100,
-        "cycle": 4,
-        "week_days": 0x7F,
-        "period_length": 2,
-        "synchro_day": 0,
-        "period_start_date": None,
-        "start_times": [270, None, None, None, None, None, None, None],
-        "station_durations": [0, 180],
-    }
-    expected = protocol.normalize_irrigation_program_for_write(
-        program,
-        max_stations=protocol.MAX_PROGRAM_STATIONS,
+async def test_set_irrigation_program_preserves_nonzero_hidden_slot() -> None:
+    """An edit patches physical outputs without replacing hidden storage."""
+    client = StatelessSolemClient(
+        "AA:BB:CC:DD:EE:FF", max_station_num=6, mock=True
     )
-    written = {
-        1: {
-            **expected,
-            "station_durations": [0, 180, 0, 0, 0, 0, 300, 0, 0, 0, 0, 0],
-        }
-    }
-    write = AsyncMock()
-    readback = AsyncMock(return_value=written)
-    monkeypatch.setattr(client, "write_irrigation_program", write)
-    monkeypatch.setattr(client, "get_irrigation_config", readback)
+    before = await client.get_program_snapshot()
+    _, with_hidden = before.patch(1, {"station_durations": {7: 300}}, 12)
+    client._mock_snapshot = with_hidden
+    program = dict(with_hidden.programs[1])
+    program["water_budget"] = 75
+    program["station_durations"] = program["station_durations"][:6]
 
-    with pytest.raises(SolemConnectionError, match="station_durations"):
-        await client.set_irrigation_program(1, program)
+    result = await client.set_irrigation_program(
+        1, program, before_revision=with_hidden.revision
+    )
+
+    assert result[1]["water_budget"] == 75
+    assert result[1]["station_durations"][6] == 300
+
+
+async def test_set_irrigation_program_rejects_stale_editor_revision() -> None:
+    client = StatelessSolemClient("AA:BB:CC:DD:EE:FF", mock=True)
+    program = (await client.get_program_snapshot()).programs[0]
+
+    with pytest.raises(StaleProgram, match="editor was opened"):
+        await client.set_irrigation_program(
+            0, program, before_revision="stale editor revision"
+        )
 
 
 async def test_set_irrigation_program_verifies_against_real_capture_readback(
@@ -858,19 +814,20 @@ async def test_set_irrigation_program_verifies_against_real_capture_readback(
             frames.append(bytes.fromhex(event["payload_hex"]))
     snapshot = ProgramSnapshot.from_frames(tuple(frames))
 
-    client = StatelessSolemClient("AA:BB:CC:DD:EE:FF", max_station_num=6)
+    client = StatelessSolemClient(
+        "AA:BB:CC:DD:EE:FF", max_station_num=6, mock=True
+    )
+    client._mock_snapshot = snapshot
     program = cast(protocol.IrrigationProgram, dict(snapshot.programs[0]))
-    write = AsyncMock()
-    readback = AsyncMock(return_value=snapshot.programs)
+    program["water_budget"] = 75
     _pin_write_day(monkeypatch)
-    monkeypatch.setattr(client, "write_irrigation_program", write)
-    monkeypatch.setattr(client, "get_irrigation_config", readback)
 
     result = await client.set_irrigation_program(0, program)
 
-    write.assert_awaited_once_with(0, program, today=WRITE_DAY)
-    readback.assert_awaited_once()
-    assert result == snapshot.programs
+    assert result[0]["water_budget"] == 75
+    assert result[0]["station_durations"][6:] == snapshot.programs[0][
+        "station_durations"
+    ][6:]
 
 
 async def test_set_irrigation_program_accepts_get_readback_width(monkeypatch) -> None:
@@ -881,7 +838,9 @@ async def test_set_irrigation_program_accepts_get_readback_width(monkeypatch) ->
     ValueError even though the client only exposes 6 physical stations —
     hidden-slot entries are part of the on-wire program block.
     """
-    client = StatelessSolemClient("AA:BB:CC:DD:EE:FF", max_station_num=6)
+    client = StatelessSolemClient(
+        "AA:BB:CC:DD:EE:FF", max_station_num=6, mock=True
+    )
     readback_program = {
         "name": "Programma C",
         "inter_station_delay": 0,
@@ -896,21 +855,18 @@ async def test_set_irrigation_program_accepts_get_readback_width(monkeypatch) ->
         "station_durations": [0, 1500, 1500, 1500, 0, 0, 0, 0, 0, 0, 0, 0],
     }
     assert len(readback_program["station_durations"]) == protocol.MAX_PROGRAM_STATIONS
-    write = AsyncMock()
-    readback = AsyncMock(return_value={2: readback_program})
     _pin_write_day(monkeypatch)
-    monkeypatch.setattr(client, "write_irrigation_program", write)
-    monkeypatch.setattr(client, "get_irrigation_config", readback)
 
     result = await client.set_irrigation_program(2, readback_program)
 
-    write.assert_awaited_once_with(2, readback_program, today=WRITE_DAY)
-    readback.assert_awaited_once()
-    assert result == {2: readback_program}
+    assert len(result[2]["station_durations"]) == protocol.MAX_PROGRAM_STATIONS
+    assert result[2]["station_durations"][:6] == readback_program[
+        "station_durations"
+    ][:6]
 
 
-async def test_set_irrigation_program_uses_write_only_primitive(monkeypatch) -> None:
-    """Verified writes delegate the BLE write phase to the write-only primitive."""
+async def test_set_irrigation_program_uses_transactional_writer(monkeypatch) -> None:
+    """Single-program edits use the acknowledged snapshot writer."""
     client = StatelessSolemClient("AA:BB:CC:DD:EE:FF", mock=True, max_station_num=2)
     program = {
         "name": "Programme B",
@@ -924,22 +880,17 @@ async def test_set_irrigation_program_uses_write_only_primitive(monkeypatch) -> 
         "start_times": [360, None, None, None, None, None, None, None],
         "station_durations": [600, 600],
     }
-    expected = protocol.normalize_irrigation_program_for_write(
-        program,
-        max_stations=protocol.MAX_PROGRAM_STATIONS,
-    )
-    write = AsyncMock()
-    readback = AsyncMock(return_value={1: expected})
+    low_level_write = AsyncMock()
+    transactional_write = AsyncMock(side_effect=lambda _frames, expected, _before: expected)
     _pin_write_day(monkeypatch)
-    monkeypatch.setattr(client, "write_irrigation_program", write)
-    monkeypatch.setattr(client, "get_irrigation_config", readback)
-    client.mock = False
+    monkeypatch.setattr(client, "write_irrigation_program", low_level_write)
+    monkeypatch.setattr(client, "write_program_frames", transactional_write)
 
     result = await client.set_irrigation_program(1, program)
 
-    write.assert_awaited_once_with(1, program, today=WRITE_DAY)
-    readback.assert_awaited_once()
-    assert result == {1: expected}
+    transactional_write.assert_awaited_once()
+    low_level_write.assert_not_awaited()
+    assert result[1]["name"] == "Programme B"
 
 
 async def test_program_write_preflight_uses_retry_safe_snapshot(monkeypatch) -> None:
@@ -1017,7 +968,7 @@ async def test_program_write_transport_failure_after_mutation_is_uncertain_no_re
         await client.write_program_frames([frame], expected, before.revision)
 
     assert operation_calls == 1
-    assert client.program_write_diagnostics["phase"] == "await_ack"
+    assert client.program_write_diagnostics["phase"] == "uncertain"
     assert client.program_write_diagnostics["acknowledged_blocks"] == 0
 
 
