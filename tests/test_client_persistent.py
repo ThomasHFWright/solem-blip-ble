@@ -121,7 +121,7 @@ async def test_connect_passes_single_attempt_to_establish_connection(
     assert isinstance(fake, FakeV2Client)
     assert len(calls) == 1
     args, kwargs = calls[0]
-    assert args[0] is BleakClientWithServiceCache
+    assert issubclass(args[0], BleakClientWithServiceCache)
     assert kwargs["max_attempts"] == 1
 
 

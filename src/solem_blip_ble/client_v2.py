@@ -92,6 +92,7 @@ from .exceptions import (
 )
 from .snapshot import ProgramSnapshot
 from .station_names import StationNameSnapshot
+from .locking import controller_lock
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -227,6 +228,9 @@ class StatelessSolemClient:
         self._link_dropped = False
         self._drop_event = asyncio.Event()
         self._active_client: BleakClient | None = None
+        self._connecting_client: BleakClient | None = None
+        self._cleanup_tasks: set[asyncio.Task[Any]] = set()
+        self._transaction_lock = controller_lock(mac_address)
         self.last_snapshot: ProgramSnapshot | None = None
         self.program_write_diagnostics: dict[str, Any] = {}
         self.station_name_write_diagnostics: dict[str, Any] = {}
@@ -247,8 +251,10 @@ class StatelessSolemClient:
     # -- device resolution -------------------------------------------------
 
     async def _resolve_ble_device(self) -> BLEDevice:
-        """Resolve a fresh BLEDevice, honouring the cache TTL."""
+        """Resolve HA routing afresh; cache only standalone scanner results."""
         if (
+            self._ble_device_resolver is None
+            and
             self._ble_device is not None
             and self._ble_device_cached_at is not None
             and time.monotonic() - self._ble_device_cached_at < BLE_DEVICE_CACHE_TTL
@@ -331,9 +337,16 @@ class StatelessSolemClient:
         connect_kwargs: dict[str, Any] = {}
         if self._ble_device_resolver is not None:
             connect_kwargs["ble_device_callback"] = self._ble_device_callback
+        owner = self
+
+        class OwnedClient(BleakClientWithServiceCache):
+            def __init__(self, *args: Any, **kwargs: Any) -> None:
+                super().__init__(*args, **kwargs)
+                owner._connecting_client = self
+
         try:
             client = await establish_connection(
-                BleakClientWithServiceCache,
+                OwnedClient,
                 ble_device,
                 name=f"Solem - {self.mac_address}",
                 timeout=self.bluetooth_timeout,
@@ -419,13 +432,107 @@ class StatelessSolemClient:
         self._link_dropped = False
         self._drop_event.clear()
 
-    async def _disconnect_quietly(self, client: BleakClient) -> None:
-        try:
-            await asyncio.wait_for(client.disconnect(), timeout=3.0)
-        except Exception as exc:  # noqa: BLE001
-            _LOGGER.debug("%s - Disconnect cleanup: %s", self.mac_address, exc)
+    def transaction(self) -> Any:
+        """Return the shared, task-reentrant controller transaction."""
+        return self._transaction_lock.hold()
+
+    @property
+    def cleanup_pending(self) -> bool:
+        """Return whether a prior operation still owns unresolved cleanup."""
+        return self._transaction_lock.recover is not None
+
+    def _retain_cleanup_task(self, task: asyncio.Task[Any]) -> None:
+        self._cleanup_tasks.add(task)
+
+        def finished(done: asyncio.Task[Any]) -> None:
+            self._cleanup_tasks.discard(done)
+            if not done.cancelled():
+                try:
+                    done.result()
+                except Exception:  # noqa: BLE001
+                    _LOGGER.debug("BLE cleanup task failed", exc_info=True)
+
+        task.add_done_callback(finished)
+
+    async def _disconnect_quietly(self, client: BleakClient) -> bool:
+        """Try several bounded disconnects and report whether the link released."""
+        for _ in range(2):
+            task = asyncio.create_task(client.disconnect())
+            self._retain_cleanup_task(task)
+            done, _ = await asyncio.wait({task}, timeout=DISCONNECT_CLEANUP_TIMEOUT)
+            if not done:
+                task.cancel()
+                return False
+            try:
+                task.result()
+            except (Exception, asyncio.CancelledError):
+                _LOGGER.debug("BLE disconnect attempt failed", exc_info=True)
+            if not client.is_connected:
+                return True
+        return False
+
+    async def _recover_cleanup(self, client: BleakClient | None) -> bool:
+        """Retry one unresolved cleanup without racing its retained tasks."""
+        if any(not task.done() for task in self._cleanup_tasks):
+            return False
+        recovered = await self._cleanup(client, [])
+        if recovered:
+            _LOGGER.info(
+                "%s - Bluetooth cleanup completed; automatic connections resumed",
+                self.mac_address,
+            )
+        return recovered
+
+    async def _cleanup(
+        self, client: BleakClient | None, tasks: list[asyncio.Task[Any]]
+    ) -> bool:
+        """Bound cancellation cleanup and defer reuse while work remains."""
+
+        async def finish() -> bool:
+            for task in tasks:
+                task.cancel()
+                self._retain_cleanup_task(task)
+            pending: set[asyncio.Task[Any]] = set()
+            if tasks:
+                _, pending = await asyncio.wait(tasks, timeout=2.0)
+            released = client is None or await self._disconnect_quietly(client)
+            if pending:
+                _, pending = await asyncio.wait(pending, timeout=2.0)
+            return released and not pending
+
+        cleanup = asyncio.create_task(finish())
+        cancelled = False
+        while not cleanup.done():
+            try:
+                await asyncio.shield(cleanup)
+            except asyncio.CancelledError:
+                cancelled = True
+        released = cleanup.result()
+        if not released:
+            self._transaction_lock.defer_cleanup(
+                lambda: self._recover_cleanup(client)
+            )
+            _LOGGER.debug(
+                "%s - Bluetooth cleanup pending; the next operation will retry cleanup",
+                self.mac_address,
+            )
+        if cancelled:
+            raise asyncio.CancelledError
+        return released
 
     async def _run_operation(
+        self,
+        operation: Callable[[BleakClient], Awaitable[_T]],
+        *,
+        deadline: float | None = None,
+        retry_safe: bool = True,
+    ) -> _T:
+        async with self.transaction():
+            return await self._run_operation_locked(
+                operation, deadline=deadline, retry_safe=retry_safe
+            )
+
+    async def _run_operation_locked(
         self,
         operation: Callable[[BleakClient], Awaitable[_T]],
         *,
@@ -451,6 +558,7 @@ class StatelessSolemClient:
         last_error: Exception | None = None
 
         for attempt in range(1, REQUEST_MAX_ATTEMPTS + 1):
+            await self._transaction_lock.check_cleanup()
             remaining = deadline_at - time.monotonic()
             if remaining <= 0:
                 raise SolemDeadlineExceeded(
@@ -521,16 +629,20 @@ class StatelessSolemClient:
                 if not retry_safe:
                     raise
             finally:
-                if op_task is not None and not op_task.done():
-                    op_task.cancel()
-                if drop_task is not None:
-                    drop_task.cancel()
-                if client is not None:
-                    if self._active_client is client:
-                        self._active_client = None
+                try:
+                    await self._cleanup(
+                        client or self._connecting_client,
+                        [
+                            task
+                            for task in (op_task, drop_task)
+                            if task is not None
+                        ],
+                    )
+                finally:
+                    self._active_client = None
+                    self._connecting_client = None
                     self._link_dropped = False
                     self._drop_event.clear()
-                    await self._disconnect_quietly(client)
 
             if (
                 time.monotonic() < deadline_at
@@ -662,23 +774,22 @@ class StatelessSolemClient:
         if self.mock:
             raise SolemConnectionError("Raw BLE sessions are unavailable in mock mode")
 
-        client = await self._connect()
-        self._active_client = client
-        try:
-            yield SolemRawBleSession(
-                client=client,
-                notify_characteristic=_find_characteristic(client, NOTIFY_CHAR_UUID),
-                write_characteristic=_find_characteristic(client, WRITE_CHAR_UUID),
-            )
-        finally:
-            if self._active_client is client:
-                # Only clear the drop signal while we still own the shared
-                # instance state; a concurrent operation may have installed
-                # its own client (and its own in-flight drop hint).
-                self._active_client = None
-                self._link_dropped = False
-                self._drop_event.clear()
-            await self._disconnect_quietly(client)
+        async with self.transaction():
+            await self._transaction_lock.check_cleanup()
+            client = await self._connect()
+            self._active_client = client
+            try:
+                yield SolemRawBleSession(
+                    client=client,
+                    notify_characteristic=_find_characteristic(client, NOTIFY_CHAR_UUID),
+                    write_characteristic=_find_characteristic(client, WRITE_CHAR_UUID),
+                )
+            finally:
+                if self._active_client is client:
+                    self._active_client = None
+                    self._link_dropped = False
+                    self._drop_event.clear()
+                await self._cleanup(client, [])
 
     async def get_status(self, *, include_raw: bool = False) -> dict[str, Any]:
         """Poll status via commit (triggers seq 0x02 notification)."""

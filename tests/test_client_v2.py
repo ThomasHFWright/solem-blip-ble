@@ -132,7 +132,7 @@ async def test_connect_passes_single_attempt_to_establish_connection(
     assert isinstance(fake, FakeV2Client)
     assert len(calls) == 1
     args, kwargs = calls[0]
-    assert args[0] is BleakClientWithServiceCache
+    assert issubclass(args[0], BleakClientWithServiceCache)
     assert kwargs["max_attempts"] == 1
 
 
@@ -517,7 +517,7 @@ async def test_teardown_hint_does_not_poison_next_operation(
     client = StatelessSolemClient("AA:BB:CC:DD:EE:FF")
     state["real"] = client
     await asyncio.wait_for(client.get_status(), timeout=5.0)
-    assert client._link_dropped is True  # hint left by teardown...
+    assert client._link_dropped is False  # teardown hints are cleared
 
     # ...but the next operation is unaffected (the old bug killed this one).
     await asyncio.wait_for(client.get_status(), timeout=5.0)
@@ -526,8 +526,8 @@ async def test_teardown_hint_does_not_poison_next_operation(
     assert second.disconnects == 1
 
 
-async def test_ble_device_cache_expires(monkeypatch) -> None:
-    """Resolve is skipped while the cache is fresh, and re-run after expiry."""
+async def test_ble_device_cache_only_applies_without_resolver(monkeypatch) -> None:
+    """HA routing stays fresh while standalone scanner results may be cached."""
     fake_connect = asyncio.Event()
 
     async def fake_connect_impl(self):
@@ -546,16 +546,13 @@ async def test_ble_device_cache_expires(monkeypatch) -> None:
         resolves.append(None)
         return None  # resolver yields nothing -> connect fails
 
-    client._ble_device_resolver = counting_resolver  # type: ignore[assignment]
-
-    # Fresh cache: the resolver is not consulted at connect time.
+    # Standalone mode reuses a fresh scanner result.
     await client._connect()
     assert len(resolves) == 0
     assert client._ble_device is fresh_device
 
-    # Expired cache: re-resolve consults the resolver; with a resolver that
-    # yields nothing, resolution fails.
-    client._ble_device_cached_at = time.monotonic() - 60.0
+    # A configured HA resolver is authoritative even while that cache is fresh.
+    client._ble_device_resolver = counting_resolver  # type: ignore[assignment]
     with pytest.raises(SolemConnectionError):
         await client._resolve_ble_device()
     assert len(resolves) == 1
