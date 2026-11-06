@@ -409,6 +409,18 @@ class PersistentSolemClient(StatelessSolemClient):
         deadline: float | None = None,
         retry_safe: bool = True,
     ) -> _T:
+        async with self.transaction():
+            return await self._run_operation_locked(
+                operation, deadline=deadline, retry_safe=retry_safe
+            )
+
+    async def _run_operation_locked(
+        self,
+        operation: Callable[[BleakClient], Awaitable[_T]],
+        *,
+        deadline: float | None = None,
+        retry_safe: bool = True,
+    ) -> _T:
         """Run one operation over a held connection, keeping it on success.
 
         Same structure as the stateless executor: whole-operation deadline,

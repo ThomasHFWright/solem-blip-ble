@@ -123,6 +123,9 @@ class _SnapshotNameSession:
     async def stop_notify(self, _uuid: str) -> None:
         self.handler = None
 
+    async def disconnect(self) -> None:
+        self.is_connected = False
+
     async def write_gatt_char(
         self, _uuid: str, payload: bytes, *, response: bool
     ) -> None:
@@ -141,6 +144,7 @@ def _patch_connection(monkeypatch, fake) -> None:
         return object()
 
     async def fake_connect(self):
+        fake.is_connected = True
         return fake
 
     monkeypatch.setattr(
