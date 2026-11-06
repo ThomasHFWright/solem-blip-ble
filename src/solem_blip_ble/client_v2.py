@@ -232,6 +232,7 @@ class StatelessSolemClient:
         self._cleanup_tasks: set[asyncio.Task[Any]] = set()
         self._transaction_lock = controller_lock(mac_address)
         self.last_snapshot: ProgramSnapshot | None = None
+        self._mock_snapshot: ProgramSnapshot | None = None
         self.program_write_diagnostics: dict[str, Any] = {}
         self.station_name_write_diagnostics: dict[str, Any] = {}
         self._mock_station_names: StationNameSnapshot | None = None
@@ -1256,25 +1257,46 @@ class StatelessSolemClient:
         """Read persisted irrigation programs (A/B/C) from the V5 controller."""
         request = protocol.pack_get_irrigation_config()
         if self.mock:
-            return {
-                program_index: {
-                    "name": f"Program {chr(ord('A') + program_index)}",
-                    "inter_station_delay": 0,
-                    "water_budget": 100,
-                    "cycle": 0,
-                    "week_days": 0x7F,
-                    "period_length": 1,
-                    "synchro_day": 0,
-                    "period_start_date": None,
-                    "controller_date": None,
-                    "start_times": [420 + program_index * 60, None, None, None, None, None, None, None],
-                    "station_durations": [
-                        600 if station == 0 else 0
-                        for station in range(self.max_station_num)
-                    ],
-                }
-                for program_index in range(protocol.IRRIGATION_PROGRAM_COUNT)
-            }
+            if self._mock_snapshot is None:
+                frames: list[bytes] = []
+                for program_index in range(protocol.IRRIGATION_PROGRAM_COUNT):
+                    program: protocol.IrrigationProgram = {
+                        "name": f"Program {chr(ord('A') + program_index)}",
+                        "inter_station_delay": 0,
+                        "water_budget": 100,
+                        "cycle": 0,
+                        "week_days": 0x7F,
+                        "period_length": 1,
+                        "synchro_day": 0,
+                        "period_start_date": None,
+                        "controller_date": None,
+                        "start_times": [
+                            420 + program_index * 60,
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                        ],
+                        "station_durations": [
+                            600 if station == 0 else 0
+                            for station in range(protocol.MAX_PROGRAM_STATIONS)
+                        ],
+                    }
+                    writes = protocol.pack_set_irrigation_program(
+                        program_index,
+                        program,
+                        max_stations=protocol.MAX_PROGRAM_STATIONS,
+                    )
+                    frames.extend(
+                        frame[:2] + bytes([6 - chunk]) + frame[3:]
+                        for chunk, frame in enumerate(writes)
+                    )
+                self._mock_snapshot = ProgramSnapshot.from_frames(tuple(frames))
+            self.last_snapshot = self._mock_snapshot
+            return self.last_snapshot.programs
 
         async def _op(client: BleakClient) -> dict[int, protocol.IrrigationProgram]:
             payloads: list[bytes] = []
@@ -1372,7 +1394,7 @@ class StatelessSolemClient:
         UncertainWrite.
         """
         if self.mock:
-            self.last_snapshot = expected
+            self._mock_snapshot = self.last_snapshot = expected
             return expected
 
         # Preflight is read-only and therefore retry-safe. Perform it as a
@@ -1536,6 +1558,7 @@ class StatelessSolemClient:
             raise
         except Exception as exc:
             if mutation_started:
+                self.program_write_diagnostics["phase"] = "uncertain"
                 raise UncertainWrite("Program write outcome is uncertain; refresh before retrying") from exc
             raise
 
@@ -1608,8 +1631,9 @@ class StatelessSolemClient:
         program: protocol.IrrigationProgram,
         *,
         today: date | None = None,
+        before_revision: str | None = None,
     ) -> dict[int, protocol.IrrigationProgram]:
-        """Write one persisted V5 irrigation program and verify by reading it back.
+        """Safely patch one program after a fresh revision preflight.
 
         One write day is shared by the expected-program normalization and the
         wire write, so the controller-owned header date and the derived
@@ -1623,30 +1647,39 @@ class StatelessSolemClient:
         """
         if today is None:
             today = date.today()
-        expected = protocol.normalize_irrigation_program_for_write(
+        normalized = protocol.normalize_irrigation_program_for_write(
             program,
             today=today,
             max_stations=protocol.MAX_PROGRAM_STATIONS,
         )
-
-        if self.mock:
-            programs = await self.get_irrigation_config()
-            programs[program_index] = expected
-            return programs
-
-        await self.write_irrigation_program(program_index, program, today=today)
-        programs = await self.get_irrigation_config()
-        written = programs.get(program_index)
-        mismatches = protocol.irrigation_program_write_mismatches(written, expected)
-        if mismatches:
-            details = ", ".join(
-                f"{field}: expected {expected_value!r}, got {actual_value!r}"
-                for field, (expected_value, actual_value) in mismatches.items()
+        async with self.transaction():
+            current = await self.get_program_snapshot()
+            if before_revision is not None and current.revision != before_revision:
+                raise StaleProgram(
+                    "Programs changed since the editor was opened; refresh before writing"
+                )
+            changes = {
+                key: value
+                for key, value in normalized.items()
+                if key
+                not in {"period_start_date", "controller_date", "station_durations"}
+            }
+            station_count = min(
+                self.station_count, len(normalized["station_durations"])
             )
-            raise SolemConnectionError(
-                f"Irrigation program write verification failed ({details})"
+            changes["station_durations"] = {
+                station: normalized["station_durations"][station - 1]
+                for station in range(1, station_count + 1)
+            }
+            frames, expected = current.patch(
+                program_index, changes, self.station_count
             )
-        return programs
+            if expected.revision == current.revision:
+                return current.programs
+            verified = await self.write_program_frames(
+                frames, expected, current.revision
+            )
+            return verified.programs
 
     async def set_time(self, when: datetime | None = None) -> None:
         """Push local date/time to the device RTC as a verified transaction.
